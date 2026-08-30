@@ -2026,6 +2026,124 @@ export function isStellarName(value: string): boolean {
   return v.endsWith(".xlm") || v.includes("*");
 }
 
+// ─── Unified destination resolution pipeline ────────────────────────────────
+//
+// Issue #732 — Destination resolution was split across overlapping effects
+// and submit-time branches with different errors.  This pipeline provides a
+// single entry point used identically for live preview and submission.
+
+/** Classifies the kind of destination the user entered. */
+export type DestinationKind =
+  | "address"    // raw G... public key
+  | "federation" // user*domain.com
+  | "sns"        // alice.xlm (resolved via xlm.money federation)
+  | "username"   // @alice / alice (resolved via backend API)
+  | "unknown";   // empty or unrecognised
+
+/** Normalised input: trimmed, without leading @. */
+export interface DestinationValidation {
+  /** Whether the input can be resolved (or is already a valid address). */
+  valid: boolean;
+  /** Trimmed, normalised input string. */
+  normalized: string;
+  /** Detected destination type. */
+  kind: DestinationKind;
+  /** Human-readable error when `valid` is false. */
+  error?: string;
+}
+
+/** Result of a successful destination resolution. */
+export interface ResolvedDestination {
+  /** The resolved Stellar public key (G... address). */
+  publicKey: string;
+  /** The original, un-normalised user input. */
+  raw: string;
+  /** How the destination was resolved. */
+  kind: DestinationKind;
+}const USERNAME_REGEX = /^[a-zA-Z0-9]{3,20}$/;
+
+/**
+ * Classify a raw destination string without making any network calls.
+ *
+   * This is the single source of truth for "what kind of destination is this?"
+ * and is used by both the live preview (debounced) and the submit path.
+ */
+export function classifyDestination(raw: string): DestinationValidation {
+  const normalized = raw.trim();
+  if (!normalized) {
+    return { valid: false, normalized, kind: "unknown", error: "Destination is required." };
+  }
+
+  if (isValidStellarAddress(normalized)) {
+    return { valid: true, normalized, kind: "address" };
+  }
+
+  if (isStellarName(normalized)) {
+    // .xlm or user*domain — valid format, needs async resolution
+    return { valid: true, normalized, kind: normalized.endsWith(".xlm") ? "sns" : "federation" };
+  }
+
+  // Strip optional @ prefix for username matching
+  const stripped = normalized.replace(/^@/, "");
+  if (USERNAME_REGEX.test(stripped)) {
+    return { valid: true, normalized: stripped, kind: "username" };
+  }
+
+  return {
+    valid: false,
+    normalized,
+    kind: "unknown",
+    error: "Enter a valid Stellar public key, federation address, .xlm name, or username.",
+  };
+}
+
+/**
+ * Resolve any supported destination type to a Stellar public key.
+ *
+ * This is the **only** function callers should use — it replaces the
+ * ad-hoc `resolveDestinationForPayment` in `SendPaymentForm` and the
+ * duplicated SNS / federation / username branches elsewhere.
+ * * @param raw    - The raw destination string from the user.
+ * @param resolveUsername - Optional username resolver (injected to avoid a
+ *                         hard dependency on the backend API module).
+ * @returns The resolved public key, normalised input, and resolution kind.
+ * @throws {Error} If the input is invalid or resolution fails.
+ */
+export async function resolveDestination(
+  raw: string,
+  resolveUsername?: (username: string) => Promise<string>,
+): Promise<ResolvedDestination> {
+  const classification = classifyDestination(raw);
+  if (!classification.valid) {
+    throw new Error(classification.error);
+  }
+
+  switch (classification.kind) {
+    case "address":
+      return { publicKey: classification.normalized, raw, kind: "address" };
+
+    case "federation":
+    case "sns": {
+      const publicKey = await resolveStellarName(classification.normalized);
+      return { publicKey, raw, kind: classification.kind };
+    }
+
+    case "username": {
+      if (!resolveUsername) {
+        throw new Error("Username resolver is not available.");
+      }
+      const publicKey = await resolveUsername(classification.normalized);
+      if (!isValidStellarAddress(publicKey)) {
+        throw new Error("Username resolution did not return a valid public key.");
+      }
+      return { publicKey, raw, kind: "username" };
+    }
+
+    default:
+      throw new Error("Enter a valid Stellar public key, federation address, .xlm name, or username.");
+  }
+}
+
 // ─── Escrow (issue #213) ──────────────────────────────────────────────────────
 //
 // Thin wrappers around the contract's create_escrow / claim_escrow /

@@ -18,11 +18,9 @@ import {
   buildSorobanTipTransaction,
   explorerUrl,
   fetchNetworkFeeStats,
-  isValidFederationAddress,
   isValidStellarAddress,
-  isStellarName,
-  resolveFederationAddress,
-  resolveStellarName,
+  classifyDestination,
+  resolveDestination,
   server,
   STELLAR_BASE_FEE_XLM,
   STELLAR_MEMO_TEXT_MAX_BYTES,
@@ -31,7 +29,8 @@ import {
   truncateMemoText,
   getNetworkPassphrase,
   setNetworkConfig,
-  getNetworkConfig
+  getNetworkConfig,
+  type DestinationKind,
 } from "@/lib/stellar";
 import { MULTISIG_THRESHOLD_XLM } from "@/components/MultiSigFlow";
 import { signTransactionWithWallet } from "@/lib/wallet";
@@ -152,9 +151,9 @@ function SendPaymentForm({
   const [destinationResolutionError, setDestinationResolutionError] = useState<string | null>(null);
   const [resolvedPaymentDestination, setResolvedPaymentDestination] = useState<string | null>(null);
   // SNS-specific state: live resolution preview as the user types
-  const [snsResolving, setSnsResolving] = useState(false);
-  const [snsResolvedAddress, setSnsResolvedAddress] = useState<string | null>(null);
-  const snsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [destClassification, setDestClassification] = useState<ReturnType<typeof classifyDestination> | null>(null);
+  const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
+  const destDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [customAsset, setCustomAsset] = useState<CustomAsset>({ code: "", issuer: "" });
   const [showCustomAssetForm, setShowCustomAssetForm] = useState(false);
   const [selectedMemoTemplate, setSelectedMemoTemplate] = useState<string | null>(null);
@@ -402,42 +401,53 @@ function SendPaymentForm({
     setResolvedPaymentDestination(null);
   }, [prefill, accountBalances]);
 
-  // Debounced SNS resolution — fires 400ms after the user stops typing a
-  // .xlm name or federation address.  Shows an inline spinner during lookup
-  // and the resolved G... address (or an error) below the destination field.
+  // Debounced destination classification + preview resolution.
+  // Fires 400ms after the user stops typing.  Uses the unified pipeline
+  // (classifyDestination + resolveDestination) so preview and submit
+  // follow identical validation logic.
   useEffect(() => {
-    if (snsDebounceRef.current) clearTimeout(snsDebounceRef.current);
+    if (destDebounceRef.current) clearTimeout(destDebounceRef.current);
 
     const trimmed = destination.trim();
+    const classification = classifyDestination(trimmed);
+    setDestClassification(classification);
 
-    // Only trigger for SNS/federation names — raw addresses and usernames are
-    // handled elsewhere.
-    if (!isStellarName(trimmed)) {
-      setSnsResolvedAddress(null);
-      setSnsResolving(false);
+    // Addresses need no async resolution — clear any stale state
+    if (classification.kind === "address") {
+      setResolvedAddress(null);
+      setIsResolvingDestination(false);
+      setDestinationResolutionError(null);
       return;
     }
 
-    setSnsResolving(true);
-    setSnsResolvedAddress(null);
+    // Invalid input — don't attempt resolution
+    if (!classification.valid) {
+      setResolvedAddress(null);
+      setIsResolvingDestination(false);
+      return;
+    }
+
+    // Names / federation / username — resolve after debounce
+    setIsResolvingDestination(true);
+    setResolvedAddress(null);
     setDestinationResolutionError(null);
 
-    snsDebounceRef.current = setTimeout(async () => {
+    destDebounceRef.current = setTimeout(async () => {
       try {
-        const resolved = await resolveStellarName(trimmed);
-        setSnsResolvedAddress(resolved);
+        const result = await resolveDestination(trimmed, resolveUsernameApi);
+        setResolvedAddress(result.publicKey);
         setDestinationResolutionError(null);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Could not resolve name";
+        const message = err instanceof Error ? err.message : "Could not resolve destination";
         setDestinationResolutionError(message);
-        setSnsResolvedAddress(null);
+        setResolvedAddress(null);
       } finally {
-        setSnsResolving(false);
+        setIsResolvingDestination(false);
       }
     }, 400);
 
     return () => {
-      if (snsDebounceRef.current) clearTimeout(snsDebounceRef.current);
+      if (destDebounceRef.current) clearTimeout(destDebounceRef.current);
     };
   }, [destination]);
 
@@ -518,13 +528,8 @@ function SendPaymentForm({
   const hasAmount = Number.isFinite(amountNum) && amountNum > 0;
   const estimatedTotalDeducted = hasAmount ? amountNum + networkFeeXlm : null;
   const trimmedDestination = destination.trim();
-  const isValidDest = trimmedDestination.length > 0 && isValidStellarAddress(trimmedDestination);
-  const isFederationDestination =
-    trimmedDestination.length > 0 && isValidFederationAddress(trimmedDestination);
-  const isUsernameDestination =
-    /^@?[a-zA-Z0-9]{3,20}$/.test(trimmedDestination) &&
-    !isValidDest &&
-    !isFederationDestination;
+  const isValidDest = destClassification?.kind === "address";
+  const isResolvableDest = destClassification?.valid === true && destClassification.kind !== "address";
   
   const MIN_STROOP = 0.0000001;
   const isValidAmt =
@@ -537,9 +542,8 @@ function SendPaymentForm({
   const isMemoValid = memoBytes <= 28;
   
   const canSubmit =
-    (isValidDest || isFederationDestination || isUsernameDestination || (isStellarName(trimmedDestination) && !!snsResolvedAddress)) &&
+    (isValidDest || (isResolvableDest && !!resolvedAddress)) &&
     !isResolvingDestination &&
-    !snsResolving &&
     !destinationResolutionError &&
     isValidAmt &&
     status === "idle" &&
@@ -548,12 +552,9 @@ function SendPaymentForm({
     !showNetworkMismatch &&
     !unsupportedAssetError;
 
-  const resolveUsername = async (username: string): Promise<string> => {
+  // Username resolver injected into the unified pipeline
+  const resolveUsernameApi = async (username: string): Promise<string> => {
     const cleanUsername = username.replace(/^@/, "").toLowerCase();
-    if (!/^[a-zA-Z0-9]{3,20}$/.test(cleanUsername)) {
-      throw new Error("Invalid username format");
-    }
-
     const apiBase = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "";
     const response = await fetch(`${apiBase}/api/accounts/resolve/${encodeURIComponent(cleanUsername)}`);
     const payload = await response.json().catch(() => null);
@@ -569,43 +570,28 @@ function SendPaymentForm({
     throw new Error("Username resolution did not return a valid public key");
   };
 
+  /**
+   * Resolve the destination for submission.  Uses the same unified pipeline
+   * as the debounced preview so validation is identical.
+   */
   const resolveDestinationForPayment = async (): Promise<string> => {
     setDestinationResolutionError(null);
 
+    // Fast path: already resolved during preview — reuse it
     if (isValidDest) {
       return trimmedDestination;
     }
-
-    // If we already resolved a SNS name in the debounced effect, use that
-    // result directly — never submit the raw name string.
-    if (isStellarName(trimmedDestination) && snsResolvedAddress) {
-      return snsResolvedAddress;
+    if (resolvedAddress) {
+      return resolvedAddress;
     }
 
+    // Slow path: resolve via the unified pipeline (should be rare —
+    // the debounced preview usually resolves first)
     setIsResolvingDestination(true);
     try {
-      // If we already resolved the SNS name in the preview, reuse it
-      if (isStellarName(trimmedDestination) && snsResolvedAddress) {
-        return snsResolvedAddress;
-      }
-
-      if (isStellarName(trimmedDestination)) {
-        return await resolveStellarName(trimmedDestination);
-      }
-
-      if (isFederationDestination) {
-        return await resolveFederationAddress(trimmedDestination);
-      }
-
-      if (isStellarName(trimmedDestination)) {
-        return await resolveStellarName(trimmedDestination);
-      }
-
-      if (isUsernameDestination) {
-        return await resolveUsername(trimmedDestination);
-      }
-
-      throw new Error("Enter a valid Stellar public key, federation address, or username.");
+      const result = await resolveDestination(trimmedDestination, resolveUsernameApi);
+      setResolvedAddress(result.publicKey);
+      return result.publicKey;
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve destination";
       setDestinationResolutionError(message);
@@ -628,7 +614,7 @@ function SendPaymentForm({
     setDestination(address);
     setDestinationResolutionError(null);
     setResolvedPaymentDestination(null);
-    setSnsResolvedAddress(null);
+    setResolvedAddress(null);
     setIsContactsDropdownOpen(false);
   };
 
@@ -673,9 +659,9 @@ function SendPaymentForm({
       setAmount("");
       setMemo("");
       setResolvedPaymentDestination(null);
-      setSnsResolved(null);
-      setSnsError(null);
-      setSnsResolving(false);
+      setResolvedAddress(null);
+      setDestClassification(null);
+      setIsResolvingDestination(false);
     }
     setStatus("idle");
   };
@@ -1018,7 +1004,7 @@ function SendPaymentForm({
                 setDestination(val);
                 setDestinationResolutionError(null);
                 setResolvedPaymentDestination(null);
-                setSnsResolvedAddress(null);
+                setResolvedAddress(null);
                 setDestAccountWarning(null);
                 setIsContactsDropdownOpen(true);
               }}
@@ -1027,36 +1013,26 @@ function SendPaymentForm({
               className={clsx(
                 "input-field font-mono text-sm",
                 destination &&
-                  !isValidDest &&
-                  !isFederationDestination &&
-                  !isUsernameDestination &&
+                  destClassification && !destClassification.valid &&
                   "border-red-500/50"
               )}
               disabled={status !== "idle" || destinationReadOnly}
               onBlur={runImmediateDestinationValidation}
             />
 
-            {/* SNS resolution feedback */}
-            {snsResolving && (
-              <div className="mt-1.5 flex items-center gap-1.5 text-xs text-slate-400">
-                <div className="w-3 h-3 border border-stellar-400 border-t-transparent rounded-full animate-spin" />
-                Resolving…
+            {/* Destination resolution feedback (unified pipeline) */}
+            {isResolvingDestination && (
+              <div className="mt-2 flex items-center gap-2 text-xs text-slate-400" aria-live="polite" aria-label="Resolving destination">
+                <div className="h-3 w-3 animate-spin rounded-full border border-stellar-400 border-t-transparent" />
+                <span>Resolving…</span>
               </div>
             )}
             {destinationResolutionError && (
               <p className="mt-2 text-xs text-red-400">{destinationResolutionError}</p>
             )}
-
-            {/* SNS resolution feedback */}
-            {snsResolving && (
-              <div className="mt-2 flex items-center gap-2 text-xs text-slate-400" aria-live="polite" aria-label="Resolving name">
-                <div className="h-3 w-3 animate-spin rounded-full border border-stellar-400 border-t-transparent" />
-                <span>Resolving name…</span>
-              </div>
-            )}
-            {!snsResolving && snsResolvedAddress && (
+            {!isResolvingDestination && resolvedAddress && (
               <p className="mt-2 text-xs text-emerald-400" aria-live="polite">
-                Resolves to: <span className="font-mono">{snsResolvedAddress}</span>
+                Resolves to: <span className="font-mono">{resolvedAddress}</span>
               </p>
             )}
 
