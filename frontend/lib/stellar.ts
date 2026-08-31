@@ -2103,7 +2103,8 @@ export function classifyDestination(raw: string): DestinationValidation {
  * This is the **only** function callers should use — it replaces the
  * ad-hoc `resolveDestinationForPayment` in `SendPaymentForm` and the
  * duplicated SNS / federation / username branches elsewhere.
- * * @param raw    - The raw destination string from the user.
+ *
+ * @param raw    - The raw destination string from the user.
  * @param resolveUsername - Optional username resolver (injected to avoid a
  *                         hard dependency on the backend API module).
  * @returns The resolved public key, normalised input, and resolution kind.
