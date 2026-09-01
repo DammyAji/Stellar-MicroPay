@@ -53,7 +53,7 @@ import {
 } from "@/components/icons";
 import clsx from "clsx";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useToastContext } from "@/lib/ToastContext";
 import { useTranslation } from "@/lib/i18n";
 
@@ -185,6 +185,8 @@ function SendPaymentForm({
   const frameRequestRef = useRef<number | null>(null);
   const isDetectingRef = useRef(false);
   const destinationInputRef = useRef<HTMLInputElement | null>(null);
+  const destinationValidationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const destinationValidationRequestRef = useRef<number>(0);
 
   // Power-user shortcut: press "S" (when not already typing in a field and no
   // modal is open) to jump focus to the destination input (#264).
@@ -539,7 +541,7 @@ function SendPaymentForm({
     !/[eE]/.test(amount);
   
   const memoBytes = new TextEncoder().encode(memo).length;
-  const isMemoValid = memoBytes <= 28;
+  const isMemoValid = memoBytes <= STELLAR_MEMO_TEXT_MAX_BYTES;
   
   const canSubmit =
     (isValidDest || (isResolvableDest && !!resolvedAddress)) &&
@@ -1088,8 +1090,8 @@ function SendPaymentForm({
           <div>
             <div className="mb-2 flex items-center justify-between">
               <label className="label mb-0">{t("memo_optional")}</label>
-              <span className={clsx("text-xs transition-colors", memoBytes > 28 ? "text-red-400 font-bold" : "text-slate-400")}>
-                {memoBytes}/28 bytes
+              <span className={clsx("text-xs transition-colors", memoBytes > STELLAR_MEMO_TEXT_MAX_BYTES ? "text-red-400 font-bold" : "text-slate-400")}>
+                {memoBytes}/{STELLAR_MEMO_TEXT_MAX_BYTES} bytes
               </span>
             </div>
             <input
@@ -1097,10 +1099,10 @@ function SendPaymentForm({
               value={memo}
               onChange={(e) => handleMemoChange(e.target.value)}
               placeholder={t("memo_placeholder")}
-              className={clsx("input-field", memoBytes > 28 && "border-red-500/50")}
+              className={clsx("input-field", memoBytes > STELLAR_MEMO_TEXT_MAX_BYTES && "border-red-500/50")}
               disabled={status !== "idle"}
             />
-            {memoBytes > 28 && (
+            {memoBytes > STELLAR_MEMO_TEXT_MAX_BYTES && (
               <p className="mt-1 text-xs text-red-400">{t("memo_limit")}</p>
             )}
           </div>
